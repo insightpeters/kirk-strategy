@@ -183,7 +183,8 @@ def fetch_all_sessions(
         df_s.insert(0, "datetime_utc", timestamps.values)
 
         asian_end_bar = _bar_index_for_midnight(session_start)
-        label = session_start.astimezone(NY).strftime("%a %b %d")
+        # Label by the NY calendar date the session trades into (open night + 1 day)
+        label = (session_start.astimezone(NY) + timedelta(days=1)).strftime("%a %b %d")
         sessions.append((label, df_s, asian_end_bar))
 
         if len(sessions) >= 5:

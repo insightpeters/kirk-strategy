@@ -168,28 +168,67 @@ def run_engine(
     result.transitions.append(Transition(0, 1, asian_end_bar - 1, "Asian session closed — PDH/PDL and Asian H/L usable"))
 
     # ─────────────────────────────────────────────────────────────────────────
-    # STATE 1 → 2: Sweep detection
-    # Bearish sweep: wick above Asian High, bar closes back below it.
-    # Bullish sweep: wick below Asian Low, bar closes back above it.
+    # STATE 1 → 2 → 3: Collect all sweep candidates then find the first one
+    # that leads to valid displacement within 10 bars.  Skipping failed sweeps
+    # lets the engine catch the real setup when an early sweep fizzles out.
     # ─────────────────────────────────────────────────────────────────────────
-    sweep_bar_idx: Optional[int] = None
-    sweep_extreme: Optional[float] = None
-    liq_direction: Optional[str] = None
-
+    sweep_candidates: list[tuple[int, str, float]] = []
     for i in range(asian_end_bar, n):
         bar = bars.iloc[i]
         if bar["high"] > asian_high and bar["close"] < asian_high:
-            liq_direction = "HIGH"
-            sweep_bar_idx = i
-            sweep_extreme = float(bar["high"])
-            break
-        if bar["low"] < asian_low and bar["close"] > asian_low:
-            liq_direction = "LOW"
-            sweep_bar_idx = i
-            sweep_extreme = float(bar["low"])
+            sweep_candidates.append((i, "HIGH", float(bar["high"])))
+        elif bar["low"] < asian_low and bar["close"] > asian_low:
+            sweep_candidates.append((i, "LOW", float(bar["low"])))
+
+    if not sweep_candidates:
+        return result  # stays at state 1
+
+    sweep_bar_idx: Optional[int] = None
+    sweep_extreme: Optional[float] = None
+    liq_direction: Optional[str] = None
+    disp_bars: list[int] = []
+
+    for cand_idx, cand_dir, cand_extreme in sweep_candidates:
+        pre_atr = compute_atr(bars.iloc[:cand_idx])
+        pre_atr_val = max(float(pre_atr.iloc[-1]) if len(pre_atr) > 0 else 1.0, 0.01)
+        exp_dir = "DOWN" if cand_dir == "HIGH" else "UP"
+
+        cand_disp: list[int] = []
+        for j in range(cand_idx + 1, min(n, cand_idx + 10)):
+            bar = bars.iloc[j]
+            body = abs(float(bar["close"]) - float(bar["open"]))
+            bar_range = float(bar["high"]) - float(bar["low"])
+            body_ratio = body / bar_range if bar_range > 0 else 0
+            is_dir = (
+                (exp_dir == "DOWN" and bar["close"] < bar["open"]) or
+                (exp_dir == "UP"   and bar["close"] > bar["open"])
+            )
+            is_strong   = body >= config.displacement_body_atr_multiplier * pre_atr_val
+            is_decisive = body_ratio >= config.displacement_body_range_ratio_min
+            if is_dir and is_strong and is_decisive:
+                cand_disp.append(j)
+            elif cand_disp:
+                break
+
+        if cand_disp:
+            sweep_bar_idx = cand_idx
+            liq_direction = cand_dir
+            sweep_extreme = cand_extreme
+            disp_bars     = cand_disp
             break
 
+    # No sweep produced displacement — show the most recent sweep seen (State 2)
     if sweep_bar_idx is None:
+        last = sweep_candidates[-1]
+        result.liq_direction = last[1]
+        result.sweep_bar     = last[0]
+        result.sweep_extreme = round(last[2], 2)
+        result.current_state = 2
+        result.transitions.append(
+            Transition(1, 2, last[0],
+                       f"Sweep {'above Asian High' if last[1]=='HIGH' else 'below Asian Low'} "
+                       f"@ {last[2]:.2f} — awaiting displacement")
+        )
         return result
 
     result.liq_direction = liq_direction
@@ -202,43 +241,9 @@ def run_engine(
                    f"@ {sweep_extreme:.2f}, bar closes back")
     )
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # STATE 2 → 3: Displacement — consecutive strong bars in sweep direction
-    #
-    # Use pre-sweep ATR so that an extreme sweep wick (e.g. +30 pts spike) does
-    # not inflate the ATR threshold and prevent legitimate displacement detection.
-    # Displacement strength is relative to normal bar size before the event.
-    # ─────────────────────────────────────────────────────────────────────────
-    pre_sweep_atr = compute_atr(bars.iloc[:sweep_bar_idx])
-    pre_sweep_atr_val = max(float(pre_sweep_atr.iloc[-1]) if len(pre_sweep_atr) > 0 else 1.0, 0.01)
-
-    disp_bars: list[int] = []
+    disp_start   = disp_bars[0]
+    disp_end     = disp_bars[-1]
     expected_dir = "DOWN" if liq_direction == "HIGH" else "UP"
-
-    for i in range(sweep_bar_idx + 1, min(n, sweep_bar_idx + 10)):
-        bar = bars.iloc[i]
-        atr_val = pre_sweep_atr_val   # pre-sweep ATR — not inflated by the sweep spike
-        body = abs(float(bar["close"]) - float(bar["open"]))
-        bar_range = float(bar["high"]) - float(bar["low"])
-        body_ratio = body / bar_range if bar_range > 0 else 0
-
-        is_directional = (
-            (expected_dir == "DOWN" and bar["close"] < bar["open"]) or
-            (expected_dir == "UP"   and bar["close"] > bar["open"])
-        )
-        is_strong = body >= config.displacement_body_atr_multiplier * atr_val
-        is_decisive = body_ratio >= config.displacement_body_range_ratio_min
-
-        if is_directional and is_strong and is_decisive:
-            disp_bars.append(i)
-        elif disp_bars:
-            break   # sequence ended; stop looking
-
-    if not disp_bars:
-        return result
-
-    disp_start = disp_bars[0]
-    disp_end   = disp_bars[-1]
     result.disp_start = disp_start
     result.disp_end   = disp_end
     result.current_state = 3
