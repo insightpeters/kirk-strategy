@@ -187,12 +187,12 @@ def _bar_ts_labels(df: pd.DataFrame) -> list[str]:
 
 # ── Signal card ───────────────────────────────────────────────────────────────
 def _signal_card(result: EngineResult, port: dict, ur: float | None,
-                 instrument: str) -> None:
+                 instrument: str, is_live: bool = True) -> None:
     s = result.current_state
     ul = UNIT_LABELS.get(instrument, "units")
 
     # Determine card type + headline
-    if not market_is_open(instrument):
+    if is_live and not market_is_open(instrument):
         card_cls = "card-wait"
         status   = "🌙  MARKET CLOSED"
         closed_msg = {
@@ -548,11 +548,8 @@ def _history_row(label: str, df: pd.DataFrame, result: EngineResult,
 
 
 def _performance_section(instrument: str) -> None:
-    today_str = datetime.now(NY).strftime("%Y-%m-%d")
-    config    = INSTRUMENT_CONFIG[instrument]
-
-    with st.spinner("Loading session history…"):
-        sessions = load_history(instrument, today_str)
+    config   = INSTRUMENT_CONFIG[instrument]
+    sessions = _week_sessions(instrument)
 
     if not sessions:
         st.caption("No historical session data available.")
@@ -700,45 +697,109 @@ def auto_refresh_bar() -> None:
         st.rerun()
 
 
+# ── Week session loader ───────────────────────────────────────────────────────
+def _week_sessions(instrument: str) -> list[tuple[str, "pd.DataFrame", int]]:
+    """Sessions from Monday of the current trading week through today.
+
+    Mon=1 session, Tue=2, … Fri/Sat/Sun=5 (full week).
+    Never crosses the Monday boundary.
+    """
+    now = datetime.now(NY)
+    wd  = now.weekday()   # 0=Mon … 6=Sun
+    # How many sessions belong to this week
+    if wd <= 4:           # Mon–Fri: wd+1 sessions (Mon=1, Tue=2, …)
+        n_keep = wd + 1
+    else:                 # Sat or Sun: full Mon–Fri week = 5 sessions
+        n_keep = 5
+
+    today_str = now.strftime("%Y-%m-%d")
+    all_hist  = load_history(instrument, today_str)   # cached hourly
+    return all_hist[-n_keep:] if len(all_hist) >= n_keep else all_hist
+
+
 # ── Render one instrument tab ─────────────────────────────────────────────────
-def render_tab(instrument: str, df: pd.DataFrame, result: EngineResult,
-               asian_end_bar: int) -> None:
-    port = portfolio(result)
-    ur   = unrealised(result, df, port)
+def render_tab(instrument: str, df_live: pd.DataFrame, result_live: EngineResult,
+               asian_end_bar_live: int) -> None:
+    config = INSTRUMENT_CONFIG[instrument]
     now_ny = datetime.now(NY)
 
-    # Header strip
+    # ── Header strip (always live) ────────────────────────────────────────
     h1, h2, h3, h4 = st.columns([2, 2, 2, 2])
     with h1:
         st.metric("NY Time", now_ny.strftime("%H:%M:%S"))
     with h2:
         st.metric("Session", current_session_label())
     with h3:
-        cur_price = f"{df['close'].iloc[-1]:.2f}" if not df.empty else "—"
+        cur_price = f"{df_live['close'].iloc[-1]:.2f}" if not df_live.empty else "—"
         st.metric(instrument, cur_price)
     with h4:
-        st.metric("Bars", len(df))
+        st.metric("Bars", len(df_live))
 
     st.divider()
 
-    # Signal card + portfolio
+    # ── Session picker ────────────────────────────────────────────────────
+    week = _week_sessions(instrument)
+    session_labels = [lbl for lbl, _, _ in week]
+
+    if len(session_labels) > 1:
+        selected = st.radio(
+            "Session",
+            options=session_labels,
+            index=len(session_labels) - 1,   # default: most recent
+            horizontal=True,
+            key=f"sess_{instrument}",
+            label_visibility="collapsed",
+        )
+    elif session_labels:
+        selected = session_labels[0]
+        st.caption(f"Session: **{selected}**")
+    else:
+        selected = None
+
+    # ── Resolve data for selected session ─────────────────────────────────
+    live_is_open = market_is_open(instrument) and not df_live.empty
+    is_live = live_is_open and (selected == session_labels[-1] if session_labels else False)
+
+    if is_live:
+        df           = df_live
+        result       = result_live
+        asian_end_bar = asian_end_bar_live
+    elif selected and week:
+        for lbl, df_s, aeb in week:
+            if lbl == selected:
+                df           = df_s
+                result       = run_engine(df_s, None, config, len(df_s) - 1, aeb)
+                asian_end_bar = aeb
+                break
+        else:
+            df, result, asian_end_bar = df_live, result_live, asian_end_bar_live
+    else:
+        df, result, asian_end_bar = df_live, result_live, asian_end_bar_live
+
+    # ── Signal card + portfolio ───────────────────────────────────────────
+    port = portfolio(result)
+    ur   = unrealised(result, df, port) if is_live else None
+
     col_sig, col_port = st.columns([3, 2])
     with col_sig:
-        _signal_card(result, port, ur, instrument)
-        st.markdown("**Strategy sequence** — today's session")
+        _signal_card(result, port, ur, instrument, is_live=is_live)
+        session_label_str = selected or "current"
+        st.markdown(f"**Strategy sequence** — {session_label_str}")
         _sequence_tracker(result, df, asian_end_bar)
     with col_port:
         _portfolio_panel(result, port, ur, instrument)
 
     st.divider()
 
-    # Chart
+    # ── Chart ─────────────────────────────────────────────────────────────
+    if not is_live and selected:
+        st.caption(f"Historical session · {selected} · all {len(df)} bars")
     fig = build_chart(df, result, instrument)
     st.plotly_chart(fig, use_container_width=True, key=f"chart_{instrument}")
 
-    # 5-day performance history
+    # ── Weekly performance history ─────────────────────────────────────────
     st.divider()
-    st.markdown("#### 5-Day Performance History")
+    st.markdown("#### This Week's Performance")
     st.caption(r"Each session run through the same FSM · \$100 risk per trade · \$10,000 account")
     _performance_section(instrument)
 
@@ -759,9 +820,9 @@ tabs = st.tabs(INSTRUMENTS)
 for tab, instrument in zip(tabs, INSTRUMENTS):
     with tab:
         with st.spinner(f"Loading {instrument}…"):
-            df, asian_end_bar = load_data(instrument, tick)
-        result = (
-            run_engine(df, None, INSTRUMENT_CONFIG[instrument], len(df) - 1, asian_end_bar)
-            if not df.empty else EngineResult()
+            df_live, asian_end_bar_live = load_data(instrument, tick)
+        result_live = (
+            run_engine(df_live, None, INSTRUMENT_CONFIG[instrument], len(df_live) - 1, asian_end_bar_live)
+            if not df_live.empty else EngineResult()
         )
-        render_tab(instrument, df, result, asian_end_bar)
+        render_tab(instrument, df_live, result_live, asian_end_bar_live)
