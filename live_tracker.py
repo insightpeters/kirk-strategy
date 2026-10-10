@@ -113,7 +113,7 @@ st.markdown("""
 # ── Data / cache ──────────────────────────────────────────────────────────────
 @st.cache_data(ttl=60, show_spinner=False)
 def load_data(instrument: str, _ts: int) -> tuple[pd.DataFrame, int]:
-    if not market_is_open():
+    if not market_is_open(instrument):
         return pd.DataFrame(), 48   # market closed — don't show stale fallback data
     return fetch_session_bars(instrument)
 
@@ -192,10 +192,14 @@ def _signal_card(result: EngineResult, port: dict, ur: float | None,
     ul = UNIT_LABELS.get(instrument, "units")
 
     # Determine card type + headline
-    if not market_is_open():
+    if not market_is_open(instrument):
         card_cls = "card-wait"
         status   = "🌙  MARKET CLOSED"
-        sub      = "Gold futures closed · reopens Sunday 6 PM NY · check the 5-day history below for last signal"
+        closed_msg = {
+            "XAUUSD": "Gold futures closed · reopens Sunday 6 PM NY",
+            "US30":   "US30 futures closed · reopens Sunday 6 PM NY",
+        }
+        sub = closed_msg.get(instrument, "Market closed") + " · check the 5-day history below for last signal"
     elif result.veto_reason:
         card_cls, status, sub = "card-veto", "⊘  SETUP VETOED", result.veto_reason
     elif result.exit_reason == "TP_HIT":

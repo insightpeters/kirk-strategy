@@ -193,8 +193,10 @@ def fetch_all_sessions(
     return sessions
 
 
-def market_is_open(now: datetime | None = None) -> bool:
-    """Return True if gold futures are currently trading."""
+def market_is_open(instrument: str = "XAUUSD", now: datetime | None = None) -> bool:
+    """Return True if the given instrument is currently trading."""
+    if instrument.upper() == "XRPUSD":
+        return True   # crypto trades 24/7
     now_ny = (now or datetime.now(NY)).astimezone(NY)
     wd = now_ny.weekday()           # 0=Mon … 4=Fri, 5=Sat, 6=Sun
     h  = now_ny.hour + now_ny.minute / 60
