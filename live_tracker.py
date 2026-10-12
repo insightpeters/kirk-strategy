@@ -22,7 +22,7 @@ from data_loader import (
 from engine import EngineResult, NarrativeEvent, compute_ema, run_engine
 
 NY = ZoneInfo("America/New_York")
-INSTRUMENTS = ["XAUUSD", "US30", "XRPUSD"]
+INSTRUMENTS = ["XAUUSD"]
 
 ACCOUNT_SIZE = 10_000.0
 RISK_PCT     = 0.01          # 1% risk per trade = $100
@@ -787,7 +787,7 @@ def _week_sessions(instrument: str) -> list[tuple[str, "pd.DataFrame", int]]:
     return all_hist[-n_keep:] if len(all_hist) >= n_keep else all_hist
 
 
-# ── Render one instrument tab ─────────────────────────────────────────────────
+# ── Render ───────────────────────────────────────────────────────────────────
 def render_tab(instrument: str, df_live: pd.DataFrame, result_live: EngineResult,
                asian_end_bar_live: int) -> None:
     config = INSTRUMENT_CONFIG[instrument]
@@ -815,7 +815,7 @@ def render_tab(instrument: str, df_live: pd.DataFrame, result_live: EngineResult
         selected = st.radio(
             "Session",
             options=session_labels,
-            index=len(session_labels) - 1,   # default: most recent
+            index=len(session_labels) - 1,
             horizontal=True,
             key=f"sess_{instrument}",
             label_visibility="collapsed",
@@ -831,14 +831,14 @@ def render_tab(instrument: str, df_live: pd.DataFrame, result_live: EngineResult
     is_live = live_is_open and (selected == session_labels[-1] if session_labels else False)
 
     if is_live:
-        df           = df_live
-        result       = result_live
+        df            = df_live
+        result        = result_live
         asian_end_bar = asian_end_bar_live
     elif selected and week:
         for lbl, df_s, aeb in week:
             if lbl == selected:
-                df           = df_s
-                result       = run_engine(df_s, None, config, len(df_s) - 1, aeb)
+                df            = df_s
+                result        = run_engine(df_s, None, config, len(df_s) - 1, aeb)
                 asian_end_bar = aeb
                 break
         else:
@@ -846,48 +846,45 @@ def render_tab(instrument: str, df_live: pd.DataFrame, result_live: EngineResult
     else:
         df, result, asian_end_bar = df_live, result_live, asian_end_bar_live
 
-    # ── Signal card + portfolio ───────────────────────────────────────────
     port = portfolio(result)
     ur   = unrealised(result, df, port) if is_live else None
 
-    col_sig, col_port = st.columns([3, 2])
-    with col_sig:
-        _signal_card(result, port, ur, instrument, is_live=is_live)
-        session_label_str = selected or "current"
-        st.markdown(f"**Strategy sequence** — {session_label_str}")
-        _sequence_tracker(result, df, asian_end_bar)
-    with col_port:
-        _portfolio_panel(result, port, ur, instrument)
+    # ── Two-column layout: left = chart+info, right = scrollable narrative ─
+    col_left, col_right = st.columns([3, 2])
 
-    st.divider()
+    with col_left:
+        # Signal card + portfolio side-by-side
+        sig_col, port_col = st.columns([3, 2])
+        with sig_col:
+            _signal_card(result, port, ur, instrument, is_live=is_live)
+            session_label_str = selected or "current"
+            st.markdown(f"**Strategy sequence** — {session_label_str}")
+            _sequence_tracker(result, df, asian_end_bar)
+        with port_col:
+            _portfolio_panel(result, port, ur, instrument)
 
-    # ── Chart / Bot Thinking tabs ──────────────────────────────────────────
-    chart_tab, thinking_tab = st.tabs(["📊 Chart", "💬 Bot Thinking"])
+        st.divider()
 
-    with chart_tab:
+        # Chart
         if not is_live and selected:
             st.caption(f"Historical session · {selected} · all {len(df)} bars")
         fig = build_chart(df, result, instrument)
         st.plotly_chart(fig, use_container_width=True, key=f"chart_{instrument}")
 
-    with thinking_tab:
-        session_label_str = selected or "current"
-        st.markdown(
-            f"**What the bot was thinking — {session_label_str}**  \n"
-            r"Every decision point, every number checked, every pass or fail — "
-            "in the order it happened."
-        )
         st.divider()
-        _narrative_feed(result, df)
+        st.markdown("#### This Week's Performance")
+        st.caption(r"Each session run through the same FSM · \$100 risk per trade · \$10,000 account")
+        _performance_section(instrument)
 
-    # ── Weekly performance history ─────────────────────────────────────────
-    st.divider()
-    st.markdown("#### This Week's Performance")
-    st.caption(r"Each session run through the same FSM · \$100 risk per trade · \$10,000 account")
-    _performance_section(instrument)
+        with st.expander("Engine config", expanded=False):
+            st.json(INSTRUMENT_CONFIG[instrument].model_dump())
 
-    with st.expander("Engine config", expanded=False):
-        st.json(INSTRUMENT_CONFIG[instrument].model_dump())
+    with col_right:
+        session_label_str = selected or "current"
+        st.markdown(f"**Bot Thinking — {session_label_str}**")
+        st.caption("Every decision point in the order it happened · scroll to read all")
+        with st.container(height=820):
+            _narrative_feed(result, df)
 
 
 # ── Page ──────────────────────────────────────────────────────────────────────
@@ -899,13 +896,11 @@ st.caption(
 auto_refresh_bar()
 
 tick = get_tick()
-tabs = st.tabs(INSTRUMENTS)
-for tab, instrument in zip(tabs, INSTRUMENTS):
-    with tab:
-        with st.spinner(f"Loading {instrument}…"):
-            df_live, asian_end_bar_live = load_data(instrument, tick)
-        result_live = (
-            run_engine(df_live, None, INSTRUMENT_CONFIG[instrument], len(df_live) - 1, asian_end_bar_live)
-            if not df_live.empty else EngineResult()
-        )
-        render_tab(instrument, df_live, result_live, asian_end_bar_live)
+instrument = "XAUUSD"
+with st.spinner(f"Loading {instrument}…"):
+    df_live, asian_end_bar_live = load_data(instrument, tick)
+result_live = (
+    run_engine(df_live, None, INSTRUMENT_CONFIG[instrument], len(df_live) - 1, asian_end_bar_live)
+    if not df_live.empty else EngineResult()
+)
+render_tab(instrument, df_live, result_live, asian_end_bar_live)
