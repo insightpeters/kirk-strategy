@@ -25,11 +25,14 @@ NY = ZoneInfo("America/New_York")
 TICKERS: dict[str, str] = {
     "XAUUSD": "GC=F",
     "US30":   "YM=F",
+    "USOIL":  "CL=F",
+    "USDCAD": "USDCAD=X",
+    "GBPUSD": "GBPUSD=X",
     "XRPUSD": "XRP-USD",
 }
 
 # Per-instrument configs tuned for real price scales.
-# XAUUSD ~$4200/oz, US30 ~$51000, XRPUSD ~$1.50
+# XAUUSD ~$3300/oz, US30 ~$42000, USOIL ~$70/bbl, USDCAD ~1.36, GBPUSD ~1.30
 INSTRUMENT_CONFIG: dict[str, Config] = {
     "XAUUSD": Config(
         sl_method=SLMethod.STRUCTURE,
@@ -38,7 +41,6 @@ INSTRUMENT_CONFIG: dict[str, Config] = {
         sl_buffer_pts=0.5,
         tp_base_hit_pts=20.0,
         rr_ratio=1.5,
-        # Real M5 gold data: bars rarely have 70% body/range; 1.5×ATR too strict
         displacement_body_atr_multiplier=0.6,
         displacement_body_range_ratio_min=0.45,
     ),
@@ -48,6 +50,36 @@ INSTRUMENT_CONFIG: dict[str, Config] = {
         sl_fixed_pts=80.0,
         sl_buffer_pts=5.0,
         tp_base_hit_pts=100.0,
+        rr_ratio=1.5,
+        displacement_body_atr_multiplier=0.6,
+        displacement_body_range_ratio_min=0.45,
+    ),
+    "USOIL": Config(
+        sl_method=SLMethod.STRUCTURE,
+        sl_max_width_pts=3.0,
+        sl_fixed_pts=1.0,
+        sl_buffer_pts=0.05,
+        tp_base_hit_pts=1.5,
+        rr_ratio=1.5,
+        displacement_body_atr_multiplier=0.6,
+        displacement_body_range_ratio_min=0.45,
+    ),
+    "USDCAD": Config(
+        sl_method=SLMethod.STRUCTURE,
+        sl_max_width_pts=0.008,
+        sl_fixed_pts=0.003,
+        sl_buffer_pts=0.0002,
+        tp_base_hit_pts=0.004,
+        rr_ratio=1.5,
+        displacement_body_atr_multiplier=0.6,
+        displacement_body_range_ratio_min=0.45,
+    ),
+    "GBPUSD": Config(
+        sl_method=SLMethod.STRUCTURE,
+        sl_max_width_pts=0.008,
+        sl_fixed_pts=0.003,
+        sl_buffer_pts=0.0002,
+        tp_base_hit_pts=0.004,
         rr_ratio=1.5,
         displacement_body_atr_multiplier=0.6,
         displacement_body_range_ratio_min=0.45,
@@ -193,20 +225,24 @@ def fetch_all_sessions(
     return sessions
 
 
+_FOREX = {"USDCAD", "GBPUSD"}   # open Sun 5 PM NY, close Fri 5 PM NY
+
 def market_is_open(instrument: str = "XAUUSD", now: datetime | None = None) -> bool:
     """Return True if the given instrument is currently trading."""
-    if instrument.upper() == "XRPUSD":
+    inst = instrument.upper()
+    if inst == "XRPUSD":
         return True   # crypto trades 24/7
     now_ny = (now or datetime.now(NY)).astimezone(NY)
     wd = now_ny.weekday()           # 0=Mon … 4=Fri, 5=Sat, 6=Sun
     h  = now_ny.hour + now_ny.minute / 60
     if wd == 5:                     # Saturday: always closed
         return False
-    if wd == 6:                     # Sunday: opens 6 PM NY
-        return h >= 18.0
-    if wd == 4:                     # Friday: closes 5 PM NY
-        return h < 17.0
-    return True                     # Mon–Thu: open (brief 5 PM daily break ignored)
+    if wd == 4 and h >= 17.0:      # Friday after 5 PM NY: closed
+        return False
+    if wd == 6:                     # Sunday open time varies by asset class
+        sunday_open = 17.0 if inst in _FOREX else 18.0
+        return h >= sunday_open
+    return True                     # Mon–Thu: open
 
 
 def current_session_label(for_date: datetime | None = None) -> str:

@@ -22,12 +22,19 @@ from data_loader import (
 from engine import EngineResult, NarrativeEvent, compute_ema, run_engine
 
 NY = ZoneInfo("America/New_York")
-INSTRUMENTS = ["XAUUSD"]
+INSTRUMENTS = ["XAUUSD", "US30", "USOIL", "USDCAD", "GBPUSD"]
 
 ACCOUNT_SIZE = 10_000.0
 RISK_PCT     = 0.01          # 1% risk per trade = $100
 
-UNIT_LABELS = {"XAUUSD": "oz", "US30": "units", "XRPUSD": "XRP"}
+UNIT_LABELS = {
+    "XAUUSD": "oz",
+    "US30":   "units",
+    "USOIL":  "bbl",
+    "USDCAD": "units",
+    "GBPUSD": "units",
+    "XRPUSD": "XRP",
+}
 
 st.set_page_config(
     page_title="Kirk Signals",
@@ -220,8 +227,11 @@ def _signal_card(result: EngineResult, port: dict, ur: float | None,
         closed_msg = {
             "XAUUSD": "Gold futures closed · reopens Sunday 6 PM NY",
             "US30":   "US30 futures closed · reopens Sunday 6 PM NY",
+            "USOIL":  "Oil futures closed · reopens Sunday 6 PM NY",
+            "USDCAD": "Forex closed · reopens Sunday 5 PM NY",
+            "GBPUSD": "Forex closed · reopens Sunday 5 PM NY",
         }
-        sub = closed_msg.get(instrument, "Market closed") + " · check the 5-day history below for last signal"
+        sub = closed_msg.get(instrument, "Market closed") + " · check the history below for last signal"
     elif result.veto_reason:
         card_cls, status, sub = "card-veto", "⊘  SETUP VETOED", result.veto_reason
     elif result.exit_reason == "TP_HIT":
@@ -896,11 +906,13 @@ st.caption(
 auto_refresh_bar()
 
 tick = get_tick()
-instrument = "XAUUSD"
-with st.spinner(f"Loading {instrument}…"):
-    df_live, asian_end_bar_live = load_data(instrument, tick)
-result_live = (
-    run_engine(df_live, None, INSTRUMENT_CONFIG[instrument], len(df_live) - 1, asian_end_bar_live)
-    if not df_live.empty else EngineResult()
-)
-render_tab(instrument, df_live, result_live, asian_end_bar_live)
+tabs = st.tabs(INSTRUMENTS)
+for tab, instrument in zip(tabs, INSTRUMENTS):
+    with tab:
+        with st.spinner(f"Loading {instrument}…"):
+            df_live, asian_end_bar_live = load_data(instrument, tick)
+        result_live = (
+            run_engine(df_live, None, INSTRUMENT_CONFIG[instrument], len(df_live) - 1, asian_end_bar_live)
+            if not df_live.empty else EngineResult()
+        )
+        render_tab(instrument, df_live, result_live, asian_end_bar_live)
