@@ -36,6 +36,14 @@ STATE_LABELS = {
 
 # ── Data structures ───────────────────────────────────────────────────────────
 @dataclass
+class NarrativeEvent:
+    bar_idx: int
+    status: str          # "info" | "pass" | "fail" | "wait" | "scan" | "entry" | "exit_tp" | "exit_sl"
+    headline: str
+    details: list[str] = field(default_factory=list)
+
+
+@dataclass
 class Transition:
     from_state: int
     to_state: int
@@ -75,6 +83,7 @@ class ConfluenceScore:
 class EngineResult:
     current_state: int = 0
     transitions: list[Transition] = field(default_factory=list)
+    narrative: list[NarrativeEvent] = field(default_factory=list)
     confluence: Optional[ConfluenceScore] = None
 
     # Liquidity
@@ -151,21 +160,36 @@ def run_engine(
     atr_series = compute_atr(bars)
     ema_series = compute_ema(bars["close"], 20)
 
+    # Narrative helper — appends a plain-English event at each decision point
+    _n: list[NarrativeEvent] = []
+    def _N(bar_idx: int, status: str, headline: str, *details: str) -> None:
+        _n.append(NarrativeEvent(bar_idx, status, headline, list(details)))
+
     # ─────────────────────────────────────────────────────────────────────────
     # STATE 0 → 1: Asian session must be complete (bar 47 closed = bar index 47)
     # ─────────────────────────────────────────────────────────────────────────
     if reveal_idx < asian_end_bar:
         result.current_state = 0
+        _N(reveal_idx, "wait", "Asian session in progress — building the range",
+           f"Need {asian_end_bar - reveal_idx} more bars until midnight NY",
+           "Liquidity levels cannot be set until the Asian session closes")
+        result.narrative = _n
         return result
 
     asian_bars = bars.iloc[:asian_end_bar]
     asian_high = float(asian_bars["high"].max())
     asian_low  = float(asian_bars["low"].min())
+    asian_range = asian_high - asian_low
 
     result.asian_high = round(asian_high, 2)
     result.asian_low  = round(asian_low,  2)
     result.current_state = 1
     result.transitions.append(Transition(0, 1, asian_end_bar - 1, "Asian session closed — PDH/PDL and Asian H/L usable"))
+    _N(asian_end_bar - 1, "info",
+       f"Asian range locked — High {asian_high:.2f}  ·  Low {asian_low:.2f}",
+       f"Range: {asian_range:.1f} pts across {asian_end_bar} bars (20:00 → 00:00 NY)",
+       f"Watching for a wick above {asian_high:.2f} (bearish setup) or below {asian_low:.2f} (bullish setup)",
+       "A valid sweep must close back on the originating side")
 
     # ─────────────────────────────────────────────────────────────────────────
     # STATE 1 → 2 → 3: Collect all sweep candidates then find the first one
@@ -187,18 +211,24 @@ def run_engine(
     sweep_extreme: Optional[float] = None
     liq_direction: Optional[str] = None
     disp_bars: list[int] = []
+    skipped_sweeps = 0
 
     for cand_idx, cand_dir, cand_extreme in sweep_candidates:
         pre_atr = compute_atr(bars.iloc[:cand_idx])
         pre_atr_val = max(float(pre_atr.iloc[-1]) if len(pre_atr) > 0 else 1.0, 0.01)
         exp_dir = "DOWN" if cand_dir == "HIGH" else "UP"
+        atr_thresh = config.displacement_body_atr_multiplier * pre_atr_val
 
         cand_disp: list[int] = []
+        best_body = 0.0
+        best_ratio = 0.0
         for j in range(cand_idx + 1, min(n, cand_idx + 10)):
             bar = bars.iloc[j]
             body = abs(float(bar["close"]) - float(bar["open"]))
             bar_range = float(bar["high"]) - float(bar["low"])
             body_ratio = body / bar_range if bar_range > 0 else 0
+            best_body = max(best_body, body)
+            best_ratio = max(best_ratio, body_ratio)
             is_dir = (
                 (exp_dir == "DOWN" and bar["close"] < bar["open"]) or
                 (exp_dir == "UP"   and bar["close"] > bar["open"])
@@ -216,6 +246,17 @@ def run_engine(
             sweep_extreme = cand_extreme
             disp_bars     = cand_disp
             break
+        else:
+            skipped_sweeps += 1
+            _N(cand_idx, "scan",
+               f"Sweep {'above' if cand_dir=='HIGH' else 'below'} "
+               f"{'Asian High' if cand_dir=='HIGH' else 'Asian Low'} @ {cand_extreme:.2f} — no displacement",
+               f"Checked {min(n, cand_idx + 10) - cand_idx - 1} bars after the sweep",
+               f"Best bar body: {best_body:.2f} pts vs threshold {atr_thresh:.2f} pts  "
+               f"({'✓' if best_body >= atr_thresh else '✗'})",
+               f"Best body/range ratio: {best_ratio:.0%} vs minimum {config.displacement_body_range_ratio_min:.0%}  "
+               f"({'✓' if best_ratio >= config.displacement_body_range_ratio_min else '✗'})",
+               "No strong directional follow-through — skipping this sweep, continuing scan")
 
     # No sweep produced displacement — show the most recent sweep seen (State 2)
     if sweep_bar_idx is None:
@@ -229,7 +270,22 @@ def run_engine(
                        f"Sweep {'above Asian High' if last[1]=='HIGH' else 'below Asian Low'} "
                        f"@ {last[2]:.2f} — awaiting displacement")
         )
+        _N(last[0], "fail",
+           f"Scanned {len(sweep_candidates)} sweep candidate(s) — none produced displacement",
+           "No valid setup found in this session",
+           "The Asian High and Low were tested but price never displaced convincingly")
+        result.narrative = _n
         return result
+
+    # Successful sweep + displacement found
+    side = "above Asian High" if liq_direction == "HIGH" else "below Asian Low"
+    _N(sweep_bar_idx, "pass",
+       f"Sweep confirmed — wick {side} @ {sweep_extreme:.2f}",
+       f"{'High' if liq_direction=='HIGH' else 'Low'} of the sweep bar: {sweep_extreme:.2f}  "
+       f"vs Asian {'High' if liq_direction=='HIGH' else 'Low'}: {asian_high if liq_direction=='HIGH' else asian_low:.2f}",
+       "Bar closed back — liquidity has been taken",
+       f"Now demanding {'bearish' if liq_direction=='HIGH' else 'bullish'} displacement"
+       + (f"  (skipped {skipped_sweeps} earlier sweep(s) with no follow-through)" if skipped_sweeps else ""))
 
     result.liq_direction = liq_direction
     result.sweep_bar     = sweep_bar_idx
@@ -244,6 +300,19 @@ def run_engine(
     disp_start   = disp_bars[0]
     disp_end     = disp_bars[-1]
     expected_dir = "DOWN" if liq_direction == "HIGH" else "UP"
+    pre_atr_final = compute_atr(bars.iloc[:sweep_bar_idx])
+    pre_atr_val_final = max(float(pre_atr_final.iloc[-1]) if len(pre_atr_final) > 0 else 1.0, 0.01)
+    disp_body_sizes = [
+        abs(float(bars.iloc[i]["close"]) - float(bars.iloc[i]["open"]))
+        for i in disp_bars
+    ]
+    _N(disp_start, "pass",
+       f"Displacement confirmed — {len(disp_bars)} strong {'bearish' if expected_dir=='DOWN' else 'bullish'} bar(s)",
+       f"Bar bodies: {', '.join(f'{b:.2f}' for b in disp_body_sizes)} pts  "
+       f"(threshold: {config.displacement_body_atr_multiplier * pre_atr_val_final:.2f} pts ✓)",
+       f"Body/range ratio ≥ {config.displacement_body_range_ratio_min:.0%} on each bar ✓",
+       "Price is moving impulsively in the expected direction — now looking for Break of Structure")
+
     result.disp_start = disp_start
     result.disp_end   = disp_end
     result.current_state = 3
@@ -273,6 +342,15 @@ def run_engine(
 
     bos_bar_idx: Optional[int] = None
     bos_found = False
+    check_word = "Close" if config.bos_requires_close else "Wick"
+
+    _N(disp_end + 1, "wait",
+       f"Watching for Break of Structure — swing reference: {swing_ref:.2f}",
+       f"The displacement must {'close' if config.bos_requires_close else 'wick'} "
+       f"{'below' if liq_direction=='HIGH' else 'above'} {swing_ref:.2f}",
+       f"(Swing ref = {'lowest low' if liq_direction=='HIGH' else 'highest high'} "
+       f"of the 8 bars immediately before the sweep)",
+       "BOS confirms that structure has genuinely shifted — not just a spike and retrace")
 
     for i in range(disp_end + 1, min(n, disp_end + 40)):   # widened: real BOS can take 2-3 hrs
         bar = bars.iloc[i]
@@ -290,9 +368,23 @@ def run_engine(
                 break
 
     if config.use_bos and not bos_found:
+        _N(min(n - 1, disp_end + 40), "fail",
+           f"Break of Structure not found — setup abandoned",
+           f"Needed a close {'below' if liq_direction=='HIGH' else 'above'} {swing_ref:.2f}",
+           f"Searched {min(n, disp_end + 40) - disp_end - 1} bars after displacement",
+           "Price displaced but never convincingly broke the pre-sweep structure",
+           "No trade taken")
+        result.narrative = _n
         return result
 
     if bos_found:
+        bos_bar_close = float(bars.iloc[bos_bar_idx]["close"])
+        _N(bos_bar_idx, "pass",
+           f"Break of Structure — {'close below' if liq_direction=='HIGH' else 'close above'} {swing_ref:.2f}",
+           f"{check_word} value: {bos_bar_close:.2f}  vs swing ref {swing_ref:.2f}  "
+           f"({'✓' if (liq_direction=='HIGH' and bos_bar_close < swing_ref) or (liq_direction=='LOW' and bos_bar_close > swing_ref) else '✗'})",
+           "Structure is broken — the market has confirmed the directional intent",
+           "Now mapping the Fibonacci retracement zone and Fair Value Gap")
         result.bos_bar   = bos_bar_idx
         result.bos_level = round(swing_ref, 2)
         result.current_state = 4
@@ -302,11 +394,11 @@ def run_engine(
                        f"swing @ {swing_ref:.2f}")
         )
     else:
-        # use_bos = False: advance directly from displacement
         bos_bar_idx = disp_end
         result.bos_level = round(swing_ref, 2)
         result.current_state = 4
         result.transitions.append(Transition(3, 4, disp_end, "BOS skipped (use_bos=False)"))
+        _N(disp_end, "info", "BOS check skipped (use_bos=False)", "Advancing from displacement directly")
 
     # ─────────────────────────────────────────────────────────────────────────
     # STATE 4 → 5: Define entry zone geometry (Fibonacci + FVG)
@@ -354,6 +446,20 @@ def run_engine(
     result.current_state = 6
     result.transitions.append(Transition(5, 6, bos_bar_idx, "Monitoring for pullback into zone"))
 
+    fvg_detail = (f"Fair Value Gap: {result.fvg_bot:.2f} – {result.fvg_top:.2f}  "
+                  f"(overlap with Fib zone improves grade)"
+                  if result.fvg_top else "No Fair Value Gap identified in displacement")
+    trade_dir_label = "SELL" if liq_direction == "HIGH" else "BUY"
+    _N(bos_bar_idx, "info",
+       f"Entry zone mapped — {trade_dir_label} area: {fib_zone_lo:.2f} – {fib_zone_hi:.2f}",
+       f"Fibonacci 50%–78.6% of displacement leg: {fib_zone_lo:.2f} – {fib_zone_hi:.2f}",
+       fvg_detail,
+       f"LOCATION IS NOT CONFIRMATION — waiting for price to pull back AND show a reaction candle")
+    _N(bos_bar_idx + 1, "wait",
+       f"Monitoring for retracement into {fib_zone_lo:.2f} – {fib_zone_hi:.2f}",
+       "Do not chase the move — the entry window opens only when price returns to the zone",
+       f"A {'bearish' if liq_direction=='HIGH' else 'bullish'} reaction candle inside the zone is required")
+
     # ─────────────────────────────────────────────────────────────────────────
     # STATE 6 → 7: Entry — price enters zone with reaction bar
     # A reaction bar: bearish (SHORT) or bullish (LONG) candle inside the zone.
@@ -391,6 +497,14 @@ def run_engine(
             break
 
     if entry_bar_idx is None:
+        bars_searched = min(n, search_start + 60) - search_start
+        _N(min(n - 1, search_start + 60), "fail",
+           "No confirmation in zone — setup expired",
+           f"Searched {bars_searched} bars ({bars_searched * 5} min) after BOS for a reaction candle",
+           f"Price {'never retraced into' if True else 'entered'} the zone {fib_zone_lo:.2f}–{fib_zone_hi:.2f}",
+           "Everything passed up to this point — the pullback or confirmation never came",
+           "No trade taken")
+        result.narrative = _n
         return result
 
     # ── Confluence scoring ────────────────────────────────────────────────────
@@ -415,11 +529,29 @@ def run_engine(
 
     conf.compute_grade()
 
+    # Confluence narrative
+    conf_items = []
+    if conf.asian_sweep:   conf_items.append("Asian sweep ✓")
+    if conf.fibonacci_zone: conf_items.append("Fibonacci zone ✓")
+    if conf.has_fvg:       conf_items.append("FVG present ✓")
+    if conf.fvg_overlap:   conf_items.append("FVG overlaps entry zone ✓")
+    if conf.ema_aligned:   conf_items.append("EMA20 aligned ✓")
+    _N(entry_bar_idx, "info",
+       f"Confluence check — Grade {conf.grade}  ({conf.score}/{6} items)",
+       "  ·  ".join(conf_items) if conf_items else "No confluence items scored",
+       f"Minimum required grade: {config.minimum_confluence_grade.value}")
+
     # Grade gate
     grade_rank = {"A": 3, "B": 2, "C": 1}
     if grade_rank[conf.grade] < grade_rank[config.minimum_confluence_grade.value]:
         result.confluence = conf
         result.veto_reason = f"Grade {conf.grade} below minimum {config.minimum_confluence_grade.value}"
+        _N(entry_bar_idx, "fail",
+           f"Setup vetoed — confluence grade too low",
+           f"Got Grade {conf.grade}, need at least Grade {config.minimum_confluence_grade.value}",
+           "The structure passed but not enough supporting factors aligned",
+           "No trade taken")
+        result.narrative = _n
         return result
 
     result.confluence = conf
@@ -446,6 +578,13 @@ def run_engine(
         result.trade_direction = trade_direction
         result.confluence   = conf
         result.veto_reason  = f"Stop too wide: {sl_width:.1f} pts > max {config.sl_max_width_pts:.0f} pts — SKIP"
+        _N(entry_bar_idx, "fail",
+           f"Setup vetoed — structural stop too wide",
+           f"Stop would be at {sl:.2f} — that's {sl_width:.1f} pts from entry {entry_price:.2f}",
+           f"Maximum allowed stop width: {config.sl_max_width_pts:.0f} pts",
+           "Never tighten the stop to force the trade — if the structure is too wide, skip it",
+           "No trade taken")
+        result.narrative = _n
         return result
 
     # ── Take-profit ───────────────────────────────────────────────────────────
@@ -462,6 +601,9 @@ def run_engine(
               else entry_price + sl_width * config.rr_ratio)
 
     rr = abs(tp - entry_price) / sl_width if sl_width > 0 else 0.0
+    tp_pts = abs(tp - entry_price)
+    dollar_risk = 100.0
+    units = dollar_risk / sl_width if sl_width > 0 else 0.0
 
     result.trade_direction = trade_direction
     result.entry_bar   = entry_bar_idx
@@ -469,6 +611,13 @@ def run_engine(
     result.sl_price    = round(sl, 2)
     result.tp_price    = round(tp, 2)
     result.rr          = round(rr, 2)
+
+    _N(entry_bar_idx, "entry",
+       f"Entry filled — {trade_direction} @ {entry_price:.2f}",
+       f"Stop Loss: {sl:.2f}  ({sl_width:.1f} pts {'above' if trade_direction=='SHORT' else 'below'} entry — at sweep extreme + buffer)",
+       f"Take Profit: {tp:.2f}  ({tp_pts:.1f} pts {'below' if trade_direction=='SHORT' else 'above'} entry)  |  R:R: {rr:.1f}R",
+       f"Position size: {units:.1f} units  |  Risk: $100 of $10,000 account  |  Grade: {conf.grade}",
+       "Trade is live — monitoring for TP or SL")
 
     result.current_state = 7
     result.transitions.append(
@@ -518,5 +667,23 @@ def run_engine(
                        f"{result.exit_reason} @ {result.exit_price:.2f} | "
                        f"P&L: {result.pnl_pts:+.2f} pts")
         )
+        dollar_pnl = units * result.pnl_pts
+        if result.exit_reason == "TP_HIT":
+            _N(result.exit_bar, "exit_tp",
+               f"Target hit @ {result.exit_price:.2f}  —  +{result.pnl_pts:.2f} pts  /  +${dollar_pnl:.2f}",
+               f"Price reached the take-profit level {result.exit_price:.2f}",
+               f"Trade duration: {result.exit_bar - entry_bar_idx} bars ({(result.exit_bar - entry_bar_idx) * 5} min)",
+               f"P&L: +{result.pnl_pts:.2f} pts  ·  {result.rr:.1f}R  ·  +${dollar_pnl:.2f} on $100 risk")
+        else:
+            _N(result.exit_bar, "exit_sl",
+               f"Stop hit @ {result.exit_price:.2f}  —  {result.pnl_pts:.2f} pts  /  −$100",
+               f"Price reached the stop level {result.exit_price:.2f}",
+               f"Trade duration: {result.exit_bar - entry_bar_idx} bars ({(result.exit_bar - entry_bar_idx) * 5} min)",
+               f"P&L: {result.pnl_pts:.2f} pts  ·  −$100 on $100 risk  (max loss enforced)")
+    else:
+        _N(n - 1, "wait",
+           "Trade still open — no TP or SL hit yet in this data window",
+           f"Holding {trade_direction} from {entry_price:.2f}  |  SL: {sl:.2f}  |  TP: {tp:.2f}")
 
+    result.narrative = _n
     return result

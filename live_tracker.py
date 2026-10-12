@@ -19,7 +19,7 @@ from data_loader import (
     INSTRUMENT_CONFIG, fetch_session_bars, fetch_all_sessions,
     current_session_label, market_is_open,
 )
-from engine import EngineResult, compute_ema, run_engine
+from engine import EngineResult, NarrativeEvent, compute_ema, run_engine
 
 NY = ZoneInfo("America/New_York")
 INSTRUMENTS = ["XAUUSD", "US30", "XRPUSD"]
@@ -106,6 +106,28 @@ st.markdown("""
 .pnl-big {
     font-size:2.8em; font-weight:800; letter-spacing:-.01em; line-height:1.1;
 }
+
+/* ── Narrative feed ── */
+.nar-msg {
+    margin-bottom:8px; padding:10px 14px; border-radius:8px;
+    border-left:4px solid #374151; background:#111827; font-family:monospace;
+}
+.nar-info   { border-left-color:#3B82F6; }
+.nar-pass   { border-left-color:#10B981; }
+.nar-fail   { border-left-color:#EF4444; background:#180909; }
+.nar-wait   { border-left-color:#F59E0B; }
+.nar-scan   { border-left-color:#4B5563; background:#0d1117; }
+.nar-entry  { border-left-color:#FBBF24; background:#181200; }
+.nar-exit-tp { border-left-color:#10B981; background:#051a0a; }
+.nar-exit-sl { border-left-color:#EF4444; background:#180909; }
+.nar-time { font-size:.78em; color:#4B5563; margin-right:10px; }
+.nar-icon { margin-right:6px; }
+.nar-head { font-weight:700; font-size:.92em; }
+.nar-detail {
+    font-size:.80em; color:#6B7280; margin-top:4px; padding-left:20px;
+    line-height:1.6;
+}
+.nar-detail::before { content:"↳ "; color:#374151; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -697,6 +719,54 @@ def auto_refresh_bar() -> None:
         st.rerun()
 
 
+# ── Narrative feed ───────────────────────────────────────────────────────────
+def _narrative_feed(result: EngineResult, df: pd.DataFrame) -> None:
+    """Render the engine's step-by-step reasoning as a chat-like timeline."""
+    if not result.narrative:
+        st.info("Waiting for data — narrative will appear once the Asian session closes.")
+        return
+
+    _ICONS = {
+        "info":    "◉",
+        "pass":    "✅",
+        "fail":    "✗",
+        "wait":    "⏳",
+        "scan":    "↺",
+        "entry":   "◆",
+        "exit_tp": "🏁",
+        "exit_sl": "✗",
+    }
+    _HEAD_COLORS = {
+        "info":    "#60A5FA",
+        "pass":    "#34D399",
+        "fail":    "#F87171",
+        "wait":    "#FCD34D",
+        "scan":    "#6B7280",
+        "entry":   "#FBBF24",
+        "exit_tp": "#34D399",
+        "exit_sl": "#F87171",
+    }
+
+    html_parts = []
+    for ev in result.narrative:
+        ts   = _bar_ts(df, ev.bar_idx)
+        icon = _ICONS.get(ev.status, "·")
+        col  = _HEAD_COLORS.get(ev.status, "#E5E7EB")
+        css  = f"nar-{ev.status.replace('_', '-')}"
+        details_html = "".join(
+            f'<div class="nar-detail">{d}</div>' for d in ev.details
+        )
+        html_parts.append(f"""
+<div class="nar-msg {css}">
+  <span class="nar-time">{ts} NY</span>
+  <span class="nar-icon">{icon}</span>
+  <span class="nar-head" style="color:{col}">{ev.headline}</span>
+  {details_html}
+</div>""")
+
+    st.markdown("\n".join(html_parts), unsafe_allow_html=True)
+
+
 # ── Week session loader ───────────────────────────────────────────────────────
 def _week_sessions(instrument: str) -> list[tuple[str, "pd.DataFrame", int]]:
     """Sessions from Monday of the current trading week through today.
@@ -791,11 +861,24 @@ def render_tab(instrument: str, df_live: pd.DataFrame, result_live: EngineResult
 
     st.divider()
 
-    # ── Chart ─────────────────────────────────────────────────────────────
-    if not is_live and selected:
-        st.caption(f"Historical session · {selected} · all {len(df)} bars")
-    fig = build_chart(df, result, instrument)
-    st.plotly_chart(fig, use_container_width=True, key=f"chart_{instrument}")
+    # ── Chart / Bot Thinking tabs ──────────────────────────────────────────
+    chart_tab, thinking_tab = st.tabs(["📊 Chart", "💬 Bot Thinking"])
+
+    with chart_tab:
+        if not is_live and selected:
+            st.caption(f"Historical session · {selected} · all {len(df)} bars")
+        fig = build_chart(df, result, instrument)
+        st.plotly_chart(fig, use_container_width=True, key=f"chart_{instrument}")
+
+    with thinking_tab:
+        session_label_str = selected or "current"
+        st.markdown(
+            f"**What the bot was thinking — {session_label_str}**  \n"
+            r"Every decision point, every number checked, every pass or fail — "
+            "in the order it happened."
+        )
+        st.divider()
+        _narrative_feed(result, df)
 
     # ── Weekly performance history ─────────────────────────────────────────
     st.divider()
