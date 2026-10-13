@@ -1,5 +1,7 @@
 streamlit>=1.55.0
 plotly>=6.0.0
 pandas>=2.0.0
+numpy>=1.24.0
 yfinance>=0.2.0
 pydantic>=2.0.0
+tzdata>=2024.1
