@@ -127,6 +127,11 @@ class EngineResult:
     # No-trade veto
     veto_reason: Optional[str] = None
 
+    # Range quality filter
+    range_source: str = "ASIAN"          # "ASIAN" | "EXTENDED"
+    range_filter_result: str = "PASS"    # "PASS" | "NARROW_EXTENDED" | "NO_DATA" | "DISABLED"
+    range_frozen_bar: Optional[int] = None
+
 
 # ── Indicator helpers ─────────────────────────────────────────────────────────
 def compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
@@ -146,6 +151,7 @@ def run_engine(
     config: Config,
     reveal_idx: int,
     asian_end_bar: int = 48,   # bar index where Asian session closes (default = 48 × 5 min = midnight)
+    median_asian_range: float | None = None,  # pre-computed median of prior sessions' Asian ranges
 ) -> EngineResult:
     """Process bars 0..reveal_idx and return current FSM state + all derived data."""
 
@@ -193,12 +199,93 @@ def run_engine(
        "A valid sweep must close back on the originating side")
 
     # ─────────────────────────────────────────────────────────────────────────
+    # RANGE QUALITY FILTER (Kirk)
+    # Compare Asian range to median of prior sessions.  If < 50% of median,
+    # extend the boundaries through the first 60 min of London before allowing
+    # any sweeps to count.  London = 3 AM NY = asian_end_bar + 36 bars.
+    # ─────────────────────────────────────────────────────────────────────────
+    london_open_bar  = asian_end_bar + 36          # 3 AM NY (midnight + 3 h × 12 bars/h)
+    london_ext_bars  = config.london_extension_minutes // 5
+    range_freeze_target = london_open_bar + london_ext_bars   # default: bar 84 + 12 = 96
+
+    # effective boundaries — updated to extended values when filter fires
+    eff_high = asian_high
+    eff_low  = asian_low
+    sweep_search_start = asian_end_bar
+
+    if not config.use_range_quality_filter:
+        result.range_filter_result = "DISABLED"
+        result.range_frozen_bar    = asian_end_bar
+    elif median_asian_range is None or median_asian_range <= 0:
+        result.range_filter_result = "NO_DATA"
+        result.range_frozen_bar    = asian_end_bar
+    else:
+        threshold = median_asian_range * config.asian_range_filter_pct
+        if asian_range >= threshold:
+            # Range is healthy — no extension needed
+            _N(asian_end_bar - 1, "pass",
+               f"Range quality OK — {asian_range:.{dp}f} pts ≥ {threshold:.{dp}f} pt floor",
+               f"Threshold: {config.asian_range_filter_pct:.0%} × {median_asian_range:.{dp}f} pt session median",
+               "Full Asian range accepted — watching for sweeps immediately")
+            result.range_filter_result = "PASS"
+            result.range_frozen_bar    = asian_end_bar
+        else:
+            # Narrow range — extend through London formation window
+            result.range_filter_result = "NARROW_EXTENDED"
+            result.range_source        = "EXTENDED"
+            _N(asian_end_bar - 1, "narrow",
+               f"Narrow Asian range — extending to London",
+               f"Asian range: {asian_range:.{dp}f} pts  ·  floor: {threshold:.{dp}f} pts "
+               f"({config.asian_range_filter_pct:.0%} of {median_asian_range:.{dp}f} pt median)",
+               f"Holding Asian boundaries and extending through first {config.london_extension_minutes} min of London",
+               f"Formation window: bars {asian_end_bar}–{range_freeze_target}  ·  sweeps blocked until frozen")
+
+            if reveal_idx < range_freeze_target:
+                # Still inside the London formation window
+                ext_slice = bars.iloc[asian_end_bar:n]
+                if len(ext_slice) > 0:
+                    eff_high = max(asian_high, float(ext_slice["high"].max()))
+                    eff_low  = min(asian_low,  float(ext_slice["low"].min()))
+                bars_remaining = range_freeze_target - reveal_idx
+                _N(reveal_idx, "wait",
+                   f"Building extended range — {reveal_idx - asian_end_bar + 1} bar(s) into London window",
+                   f"Extended high: {eff_high:.{dp}f}  ·  Extended low: {eff_low:.{dp}f}",
+                   f"Range freezes in {bars_remaining} more bar(s) — no sweeps counted until then")
+                result.asian_high        = round(eff_high, dp)
+                result.asian_low         = round(eff_low,  dp)
+                result.range_frozen_bar  = None   # sentinel: still building
+                result.narrative         = _n
+                return result
+
+            # Formation window complete — freeze the combined Asia-London range
+            actual_freeze = min(range_freeze_target, n - 1)
+            ext_slice = bars.iloc[asian_end_bar : actual_freeze + 1]
+            if len(ext_slice) > 0:
+                eff_high = max(asian_high, float(ext_slice["high"].max()))
+                eff_low  = min(asian_low,  float(ext_slice["low"].min()))
+            eff_range = eff_high - eff_low
+
+            result.asian_high       = round(eff_high, dp)
+            result.asian_low        = round(eff_low,  dp)
+            result.range_frozen_bar = actual_freeze
+            sweep_search_start      = actual_freeze
+
+            _N(actual_freeze, "pass",
+               f"Extended range frozen — High {eff_high:.{dp}f}  ·  Low {eff_low:.{dp}f}",
+               f"Combined Asia-London range: {eff_range:.{dp}f} pts  (Asian-only: {asian_range:.{dp}f} pts)",
+               "Sweeps are now live — watching for a wick outside the frozen boundaries with close-back")
+
+            # Use extended boundaries for all subsequent sweep/SL logic
+            asian_high = eff_high
+            asian_low  = eff_low
+
+    # ─────────────────────────────────────────────────────────────────────────
     # STATE 1 → 2 → 3: Collect all sweep candidates then find the first one
     # that leads to valid displacement within 10 bars.  Skipping failed sweeps
     # lets the engine catch the real setup when an early sweep fizzles out.
     # ─────────────────────────────────────────────────────────────────────────
     sweep_candidates: list[tuple[int, str, float]] = []
-    for i in range(asian_end_bar, n):
+    for i in range(sweep_search_start, n):
         bar = bars.iloc[i]
         if bar["high"] > asian_high and bar["close"] < asian_high:
             sweep_candidates.append((i, "HIGH", float(bar["high"])))

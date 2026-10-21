@@ -127,6 +127,7 @@ st.markdown("""
 .nar-entry  { border-left-color:#FBBF24; background:#181200; }
 .nar-exit-tp { border-left-color:#10B981; background:#051a0a; }
 .nar-exit-sl { border-left-color:#EF4444; background:#180909; }
+.nar-narrow  { border-left-color:#F97316; background:#1a0d00; }
 .nar-time { font-size:.78em; color:#4B5563; margin-right:10px; }
 .nar-icon { margin-right:6px; }
 .nar-head { font-weight:700; font-size:.92em; }
@@ -265,6 +266,13 @@ def _signal_card(result: EngineResult, port: dict, ur: float | None,
     elif s in (3, 4):
         card_cls, status = "card-watch", "〰  SEQUENCE BUILDING — BOS CONFIRMED"
         sub = "Displacement done · waiting for price to retrace into entry zone"
+    elif s == 1 and result.range_filter_result == "NARROW_EXTENDED" and result.range_frozen_bar is None:
+        card_cls = "card-forming"
+        status   = "⬡  BUILDING EXTENDED RANGE — LONDON WINDOW ACTIVE"
+        sub      = f"Narrow Asian range · extending high/low through London · sweeps blocked until range freezes"
+    elif s == 1 and result.range_filter_result == "NARROW_EXTENDED" and result.range_frozen_bar is not None:
+        card_cls, status = "card-watch", "⬡  EXTENDED RANGE FROZEN — WATCHING FOR SWEEP"
+        sub = f"Combined High: {result.asian_high:.2f}  ·  Low: {result.asian_low:.2f}  (Asia + London)"
     elif s == 1:
         card_cls, status = "card-watch", "◉  ASIAN RANGE SET — WATCHING FOR SWEEP"
         sub = f"High: {result.asian_high:.2f}  ·  Low: {result.asian_low:.2f}"
@@ -531,6 +539,27 @@ def load_history(instrument: str, _day: str) -> list[tuple]:
     return fetch_all_sessions(instrument, n_days=14)
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def compute_median_range(instrument: str, _day: str) -> float | None:
+    """Median Asian-session range across available historical sessions (up to 10).
+    Used as the baseline for the range quality filter.  Returns None if < 3 sessions."""
+    sessions = load_history(instrument, _day)
+    if len(sessions) < 3:
+        return None
+    ranges: list[float] = []
+    for _, df_s, aeb in sessions:
+        if len(df_s) >= aeb and aeb > 0:
+            ab = df_s.iloc[:aeb]
+            r  = float(ab["high"].max()) - float(ab["low"].min())
+            if r > 0:
+                ranges.append(r)
+    if len(ranges) < 3:
+        return None
+    ranges.sort()
+    mid = len(ranges) // 2
+    return (ranges[mid - 1] + ranges[mid]) / 2 if len(ranges) % 2 == 0 else ranges[mid]
+
+
 _STOPPED_AT = {
     0: "No data",
     1: "No sweep",
@@ -566,7 +595,12 @@ def _history_row(label: str, df: pd.DataFrame, result: EngineResult,
         stopped = "Trade open"
     else:
         outcome, pnl = "No trade", 0.0
-        stopped = _STOPPED_AT.get(s, f"State {s}")
+        if s == 1 and result.range_filter_result == "NARROW_EXTENDED" and result.range_frozen_bar is None:
+            stopped = "London forming"
+        elif s == 1 and result.range_filter_result == "NARROW_EXTENDED":
+            stopped = "No sweep (extended)"
+        else:
+            stopped = _STOPPED_AT.get(s, f"State {s}")
 
     return {
         "session":   label,
@@ -582,9 +616,10 @@ def _history_row(label: str, df: pd.DataFrame, result: EngineResult,
 
 
 def _performance_section(instrument: str) -> None:
-    config   = INSTRUMENT_CONFIG[instrument]
+    config    = INSTRUMENT_CONFIG[instrument]
     today_str = datetime.now(NY).strftime("%Y-%m-%d")
     sessions  = load_history(instrument, today_str)   # last 14 days, up to 10 sessions
+    med_range = compute_median_range(instrument, today_str)
 
     if not sessions:
         st.caption("No historical session data available.")
@@ -592,7 +627,7 @@ def _performance_section(instrument: str) -> None:
 
     rows = []
     for label, df_s, aeb in sessions:
-        r = run_engine(df_s, None, config, len(df_s) - 1, aeb)
+        r = run_engine(df_s, None, config, len(df_s) - 1, aeb, med_range)
         rows.append(_history_row(label, df_s, r, instrument))
 
     # Running P&L
@@ -748,6 +783,7 @@ def _narrative_feed(result: EngineResult, df: pd.DataFrame) -> None:
         "entry":   "◆",
         "exit_tp": "🏁",
         "exit_sl": "✗",
+        "narrow":  "⬡",
     }
     _HEAD_COLORS = {
         "info":    "#60A5FA",
@@ -758,6 +794,7 @@ def _narrative_feed(result: EngineResult, df: pd.DataFrame) -> None:
         "entry":   "#FBBF24",
         "exit_tp": "#34D399",
         "exit_sl": "#F87171",
+        "narrow":  "#F97316",
     }
 
     html_parts = []
@@ -840,8 +877,10 @@ def render_tab(instrument: str, df_live: pd.DataFrame, result_live: EngineResult
         selected = None
 
     # ── Resolve data for selected session ─────────────────────────────────
+    today_str    = datetime.now(NY).strftime("%Y-%m-%d")
+    med_range    = compute_median_range(instrument, today_str)
     live_is_open = market_is_open(instrument) and not df_live.empty
-    is_live = live_is_open and (selected == session_labels[-1] if session_labels else False)
+    is_live      = live_is_open and (selected == session_labels[-1] if session_labels else False)
 
     if is_live:
         df            = df_live
@@ -851,7 +890,7 @@ def render_tab(instrument: str, df_live: pd.DataFrame, result_live: EngineResult
         for lbl, df_s, aeb in week:
             if lbl == selected:
                 df            = df_s
-                result        = run_engine(df_s, None, config, len(df_s) - 1, aeb)
+                result        = run_engine(df_s, None, config, len(df_s) - 1, aeb, med_range)
                 asian_end_bar = aeb
                 break
         else:
@@ -909,13 +948,16 @@ st.caption(
 auto_refresh_bar()
 
 tick = get_tick()
+today_str_main = datetime.now(NY).strftime("%Y-%m-%d")
 tabs = st.tabs(INSTRUMENTS)
 for tab, instrument in zip(tabs, INSTRUMENTS):
     with tab:
         with st.spinner(f"Loading {instrument}…"):
             df_live, asian_end_bar_live = load_data(instrument, tick)
+        med_range_live = compute_median_range(instrument, today_str_main)
         result_live = (
-            run_engine(df_live, None, INSTRUMENT_CONFIG[instrument], len(df_live) - 1, asian_end_bar_live)
+            run_engine(df_live, None, INSTRUMENT_CONFIG[instrument],
+                       len(df_live) - 1, asian_end_bar_live, med_range_live)
             if not df_live.empty else EngineResult()
         )
         render_tab(instrument, df_live, result_live, asian_end_bar_live)

@@ -67,5 +67,14 @@ class Config(BaseModel):
     # Display precision — decimal places for price output (2 for commodities, 4 for forex)
     price_decimals: int = Field(2, ge=0, le=6)
 
+    # Asian range quality filter (Kirk)
+    use_range_quality_filter: bool = Field(True, description="Skip narrow Asian ranges — extend to London instead")
+    asian_range_filter_pct: float = Field(0.50, gt=0, le=1.0,
+        description="Reject if Asian range < pct × median of prior sessions")
+    asian_range_lookback: int = Field(20, gt=0,
+        description="Sessions to use for median range (capped at available history ~10)")
+    london_extension_minutes: int = Field(60, gt=0,
+        description="London formation window duration in minutes")
+
     # Confluence grading
     minimum_confluence_grade: MinGrade = Field(MinGrade.B)
