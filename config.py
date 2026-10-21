@@ -56,9 +56,15 @@ class Config(BaseModel):
     sl_buffer_pts: float = Field(0.5, ge=0)
 
     # Take-profit
-    tp_method: TPMethod = Field(TPMethod.BASE_HIT)
+    tp_method: TPMethod = Field(TPMethod.FIXED_RR)
     tp_base_hit_pts: float = Field(15.0, gt=0)
     rr_ratio: float = Field(1.5, gt=0)
+
+    # BOS search window
+    bos_search_bars: int = Field(40, gt=0, description="Bars to scan after displacement for BOS")
+
+    # Display precision — decimal places for price output (2 for commodities, 4 for forex)
+    price_decimals: int = Field(2, ge=0, le=6)
 
     # Confluence grading
     minimum_confluence_grade: MinGrade = Field(MinGrade.B)
