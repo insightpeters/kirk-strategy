@@ -173,9 +173,9 @@ def fetch_session_bars(
 
 def fetch_all_sessions(
     instrument: str,
-    n_days: int = 7,
+    n_days: int = 14,
 ) -> list[tuple[str, pd.DataFrame, int]]:
-    """Return up to 5 completed trading sessions from the last n_days calendar days.
+    """Return up to 10 completed trading sessions from the last n_days calendar days.
 
     Each entry: (label, df, asian_end_bar)
     label is the NY date the session OPENS, e.g. "Mon Sep 30".
@@ -222,7 +222,7 @@ def fetch_all_sessions(
         label = (session_start.astimezone(NY) + timedelta(days=1)).strftime("%a %b %d")
         sessions.append((label, df_s, asian_end_bar))
 
-        if len(sessions) >= 5:
+        if len(sessions) >= 10:
             break
 
     return sessions

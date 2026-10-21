@@ -527,8 +527,8 @@ def build_chart(df: pd.DataFrame, result: EngineResult, instrument: str) -> go.F
 # ── Performance history ───────────────────────────────────────────────────────
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_history(instrument: str, _day: str) -> list[tuple]:
-    """_day (e.g. '2026-10-01') rotates cache daily."""
-    return fetch_all_sessions(instrument, n_days=7)
+    """_day (e.g. '2026-10-01') rotates cache daily. Returns up to 10 sessions / 14 days."""
+    return fetch_all_sessions(instrument, n_days=14)
 
 
 _STOPPED_AT = {
@@ -549,6 +549,8 @@ def _history_row(label: str, df: pd.DataFrame, result: EngineResult,
                  instrument: str) -> dict:
     port = portfolio(result)
     s    = result.current_state
+    dp   = INSTRUMENT_CONFIG[instrument].price_decimals
+    fmt  = f".{dp}f"
 
     if result.veto_reason:
         outcome, pnl = "Vetoed", 0.0
@@ -569,9 +571,9 @@ def _history_row(label: str, df: pd.DataFrame, result: EngineResult,
     return {
         "session":   label,
         "direction": result.trade_direction or "—",
-        "entry":     f"{result.entry_price:.2f}" if result.entry_price else "—",
-        "sl":        f"{result.sl_price:.2f}"    if result.sl_price    else "—",
-        "tp":        f"{result.tp_price:.2f}"    if result.tp_price    else "—",
+        "entry":     format(result.entry_price, fmt) if result.entry_price else "—",
+        "sl":        format(result.sl_price,    fmt) if result.sl_price    else "—",
+        "tp":        format(result.tp_price,    fmt) if result.tp_price    else "—",
         "grade":     result.confluence.grade if result.confluence else "—",
         "outcome":   outcome,
         "stopped":   stopped,
@@ -581,7 +583,8 @@ def _history_row(label: str, df: pd.DataFrame, result: EngineResult,
 
 def _performance_section(instrument: str) -> None:
     config   = INSTRUMENT_CONFIG[instrument]
-    sessions = _week_sessions(instrument)
+    today_str = datetime.now(NY).strftime("%Y-%m-%d")
+    sessions  = load_history(instrument, today_str)   # last 14 days, up to 10 sessions
 
     if not sessions:
         st.caption("No historical session data available.")
@@ -882,8 +885,8 @@ def render_tab(instrument: str, df_live: pd.DataFrame, result_live: EngineResult
         st.plotly_chart(fig, use_container_width=True, key=f"chart_{instrument}")
 
         st.divider()
-        st.markdown("#### This Week's Performance")
-        st.caption(r"Each session run through the same FSM · \$100 risk per trade · \$10,000 account")
+        st.markdown("#### Recent Performance — Last 2 Weeks")
+        st.caption(r"Up to 10 sessions · \$100 risk per trade · \$10,000 account")
         _performance_section(instrument)
 
         with st.expander("Engine config", expanded=False):
