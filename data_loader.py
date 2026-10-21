@@ -62,6 +62,7 @@ INSTRUMENT_CONFIG: dict[str, Config] = {
         sl_buffer_pts=0.05,
         tp_method=TPMethod.FIXED_RR,
         rr_ratio=1.5,
+        tp_min_pts=1.5,          # crude oil needs room — TP at least 1.5 pts even with tight SL
         displacement_body_atr_multiplier=0.6,
         displacement_body_range_ratio_min=0.45,
     ),

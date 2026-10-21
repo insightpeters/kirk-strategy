@@ -58,6 +58,7 @@ class Config(BaseModel):
     # Take-profit
     tp_method: TPMethod = Field(TPMethod.FIXED_RR)
     tp_base_hit_pts: float = Field(15.0, gt=0)
+    tp_min_pts: float = Field(0.0, ge=0, description="Floor for TP distance — TP = max(rr*sl, tp_min_pts)")
     rr_ratio: float = Field(1.5, gt=0)
 
     # BOS search window

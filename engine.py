@@ -589,16 +589,23 @@ def run_engine(
 
     # ── Take-profit ───────────────────────────────────────────────────────────
     if config.tp_method == TPMethod.BASE_HIT:
-        tp = (entry_price - config.tp_base_hit_pts if trade_direction == "SHORT"
-              else entry_price + config.tp_base_hit_pts)
+        tp_pts_calc = config.tp_base_hit_pts
     elif config.tp_method == TPMethod.FIXED_RR:
-        tp = (entry_price - sl_width * config.rr_ratio if trade_direction == "SHORT"
-              else entry_price + sl_width * config.rr_ratio)
+        tp_pts_calc = sl_width * config.rr_ratio
     elif config.tp_method == TPMethod.LIQUIDITY:
+        tp_pts_calc = abs((asian_low if trade_direction == "SHORT" else asian_high) - entry_price)
+    else:
+        tp_pts_calc = sl_width * config.rr_ratio
+
+    # Apply minimum TP floor (e.g. crude oil needs at least 1.5 pts regardless of SL width)
+    if config.tp_min_pts > 0:
+        tp_pts_calc = max(tp_pts_calc, config.tp_min_pts)
+
+    if config.tp_method == TPMethod.LIQUIDITY:
         tp = asian_low if trade_direction == "SHORT" else asian_high
     else:
-        tp = (entry_price - sl_width * config.rr_ratio if trade_direction == "SHORT"
-              else entry_price + sl_width * config.rr_ratio)
+        tp = (entry_price - tp_pts_calc if trade_direction == "SHORT"
+              else entry_price + tp_pts_calc)
 
     rr = abs(tp - entry_price) / sl_width if sl_width > 0 else 0.0
     tp_pts = abs(tp - entry_price)
