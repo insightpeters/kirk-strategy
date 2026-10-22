@@ -13,6 +13,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional
 
+__version__ = "2.1.0"   # range-quality filter + aggressive RR/SL
+
 import pandas as pd
 
 from config import Config, SLMethod, TPMethod, MinGrade
