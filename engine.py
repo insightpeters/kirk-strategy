@@ -153,7 +153,6 @@ def run_engine(
     config: Config,
     reveal_idx: int,
     asian_end_bar: int = 48,   # bar index where Asian session closes (default = 48 × 5 min = midnight)
-    median_asian_range: float | None = None,  # pre-computed median of prior sessions' Asian ranges
 ) -> EngineResult:
     """Process bars 0..reveal_idx and return current FSM state + all derived data."""
 
@@ -215,10 +214,12 @@ def run_engine(
     eff_low  = asian_low
     sweep_search_start = asian_end_bar
 
+    median_asian_range = config.median_asian_range   # set by caller via model_copy
+
     if not config.use_range_quality_filter:
         result.range_filter_result = "DISABLED"
         result.range_frozen_bar    = asian_end_bar
-    elif median_asian_range is None or median_asian_range <= 0:
+    elif median_asian_range <= 0:
         result.range_filter_result = "NO_DATA"
         result.range_frozen_bar    = asian_end_bar
     else:

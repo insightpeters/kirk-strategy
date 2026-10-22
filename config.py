@@ -75,6 +75,8 @@ class Config(BaseModel):
         description="Sessions to use for median range (capped at available history ~10)")
     london_extension_minutes: int = Field(60, gt=0,
         description="London formation window duration in minutes")
+    median_asian_range: float = Field(0.0, ge=0,
+        description="Pre-computed session median — set by caller, not a tuning parameter")
 
     # Confluence grading
     minimum_confluence_grade: MinGrade = Field(MinGrade.B)

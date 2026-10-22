@@ -625,9 +625,10 @@ def _performance_section(instrument: str) -> None:
         st.caption("No historical session data available.")
         return
 
+    cfg_m = config.model_copy(update={"median_asian_range": med_range or 0.0})
     rows = []
     for label, df_s, aeb in sessions:
-        r = run_engine(df_s, None, config, len(df_s) - 1, aeb, med_range)
+        r = run_engine(df_s, None, cfg_m, len(df_s) - 1, aeb)
         rows.append(_history_row(label, df_s, r, instrument))
 
     # Running P&L
@@ -887,10 +888,11 @@ def render_tab(instrument: str, df_live: pd.DataFrame, result_live: EngineResult
         result        = result_live
         asian_end_bar = asian_end_bar_live
     elif selected and week:
+        cfg_m = config.model_copy(update={"median_asian_range": med_range or 0.0})
         for lbl, df_s, aeb in week:
             if lbl == selected:
                 df            = df_s
-                result        = run_engine(df_s, None, config, len(df_s) - 1, aeb, med_range)
+                result        = run_engine(df_s, None, cfg_m, len(df_s) - 1, aeb)
                 asian_end_bar = aeb
                 break
         else:
@@ -955,9 +957,11 @@ for tab, instrument in zip(tabs, INSTRUMENTS):
         with st.spinner(f"Loading {instrument}…"):
             df_live, asian_end_bar_live = load_data(instrument, tick)
         med_range_live = compute_median_range(instrument, today_str_main)
+        cfg_live = INSTRUMENT_CONFIG[instrument].model_copy(
+            update={"median_asian_range": med_range_live or 0.0}
+        )
         result_live = (
-            run_engine(df_live, None, INSTRUMENT_CONFIG[instrument],
-                       len(df_live) - 1, asian_end_bar_live, med_range_live)
+            run_engine(df_live, None, cfg_live, len(df_live) - 1, asian_end_bar_live)
             if not df_live.empty else EngineResult()
         )
         render_tab(instrument, df_live, result_live, asian_end_bar_live)
