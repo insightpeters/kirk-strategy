@@ -20,6 +20,11 @@ from data_loader import (
     current_session_label, market_is_open,
 )
 from engine import EngineResult, NarrativeEvent, compute_ema, run_engine
+from reversal_engine import (
+    run_reversal_engine, ReversalResult, REV_STATES, LEVEL_LABEL,
+    SHORT_LEVEL_KEYS, LONG_LEVEL_KEYS,
+)
+from reversal_data import fetch_gold_bars, compute_key_levels
 
 NY = ZoneInfo("America/New_York")
 INSTRUMENTS = ["XAUUSD", "US30", "USOIL", "USDCAD", "GBPUSD"]
@@ -136,6 +141,24 @@ st.markdown("""
     line-height:1.6;
 }
 .nar-detail::before { content:"↳ "; color:#374151; }
+
+/* ── Gold Reversal tab ── */
+.rev-card { border-radius:12px; padding:16px 20px; margin-bottom:12px; }
+.rev-card-watch   { background:#0f172a; border:1px solid #374151; }
+.rev-card-sweep   { background:#1f1030; border:2px solid #A78BFA; }
+.rev-card-reject  { background:#1a0f00; border:2px solid #F97316; }
+.rev-card-bos     { background:#061a14; border:2px solid #34D399; }
+.rev-card-retest  { background:#141000; border:2px solid #FCD34D; }
+.rev-card-basket  { background:#2d0a0a; border:2px solid #DC2626; }
+.rev-card-partial { background:#0a1f08; border:2px solid #84CC16; }
+.rev-card-closed  { background:#111827; border:1px solid #4B5563; }
+.basket-tbl { width:100%; border-collapse:collapse; font-family:monospace; font-size:.84em; }
+.basket-tbl th { color:#6B7280; border-bottom:1px solid #1f2937; padding:5px 8px;
+                 text-align:left; font-weight:normal; text-transform:uppercase; font-size:.8em; }
+.basket-tbl td { padding:5px 8px; border-bottom:1px solid #0d1117; }
+.rev-level-grid { display:flex; flex-wrap:wrap; gap:6px; margin:8px 0 12px; }
+.rev-lv { padding:3px 10px; border-radius:8px; font-family:monospace; font-size:.82em;
+          background:#111827; font-weight:600; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -941,6 +964,362 @@ def render_tab(instrument: str, df_live: pd.DataFrame, result_live: EngineResult
             _narrative_feed(result, df)
 
 
+# ── Reversal tab helpers ──────────────────────────────────────────────────────
+LEVEL_COLORS: dict[str, str] = {
+    "yesterday_high": "#9CA3AF",
+    "yesterday_low":  "#9CA3AF",
+    "asian_high":     "#60A5FA",
+    "asian_low":      "#A78BFA",
+    "london_high":    "#F97316",
+    "london_low":     "#FCD34D",
+    "session_high":   "#2DD4BF",
+    "session_low":    "#818CF8",
+}
+
+
+def _rev_bar_ts(df_5m: pd.DataFrame, bar_idx: int | None) -> str:
+    if bar_idx is None:
+        return "—"
+    try:
+        ts = pd.Timestamp(df_5m.index[bar_idx])
+        if ts.tzinfo is None:
+            ts = ts.tz_localize("UTC")
+        return ts.tz_convert(NY).strftime("%H:%M")
+    except (IndexError, TypeError):
+        return f"bar {bar_idx}"
+
+
+def build_reversal_chart(
+    df_5m: pd.DataFrame,
+    result: ReversalResult,
+    key_levels: dict[str, float],
+    reveal_idx: int,
+) -> go.Figure:
+    if df_5m.empty:
+        fig = go.Figure()
+        fig.add_annotation(text="Waiting for data…", x=0.5, y=0.5,
+                           xref="paper", yref="paper", showarrow=False,
+                           font=dict(size=16, color="#4B5563"))
+        fig.update_layout(paper_bgcolor="#0f172a", plot_bgcolor="#0f172a", height=420)
+        return fig
+
+    df_slice = df_5m.iloc[:reveal_idx + 1]
+    n = len(df_slice)
+    x = list(range(n))
+    ts_labels = [pd.Timestamp(t).tz_convert(NY).strftime("%H:%M") for t in df_slice.index]
+    tick_idxs = list(range(0, n, 12))
+
+    fig = go.Figure()
+    fig.add_trace(go.Candlestick(
+        x=x, open=df_slice["open"], high=df_slice["high"],
+        low=df_slice["low"], close=df_slice["close"],
+        name="XAUUSD",
+        increasing_line_color="#26a69a", decreasing_line_color="#ef5350",
+        increasing_fillcolor="#26a69a", decreasing_fillcolor="#ef5350",
+        line_width=1, whiskerwidth=0.4,
+    ))
+
+    for key, price in key_levels.items():
+        color = LEVEL_COLORS.get(key, "#6B7280")
+        label = LEVEL_LABEL.get(key, key)
+        fig.add_shape(type="line", x0=0, x1=n - 1, y0=price, y1=price,
+                      line=dict(color=color, width=1, dash="dash"))
+        fig.add_annotation(x=n - 1, y=price, text=f" {label} {price:.2f}",
+                           xanchor="left", showarrow=False,
+                           font=dict(size=8, color=color))
+
+    if result.sweep_bar is not None and result.sweep_extreme is not None:
+        ay = -22 if result.direction == "SHORT" else 22
+        fig.add_annotation(x=result.sweep_bar, y=result.sweep_extreme,
+                           text="SWEEP", showarrow=True, arrowhead=2,
+                           arrowcolor="#A78BFA", ax=0, ay=ay,
+                           font=dict(size=9, color="#A78BFA"))
+
+    if result.swing_ref_bar is not None and result.swing_ref_price is not None:
+        sy = result.swing_ref_price
+        fig.add_shape(type="line", x0=result.swing_ref_bar, x1=n - 1,
+                      y0=sy, y1=sy,
+                      line=dict(color="#34D399", width=1, dash="dot"))
+        fig.add_annotation(x=result.swing_ref_bar, y=sy,
+                           text="Swing ref", xanchor="right", showarrow=False,
+                           font=dict(size=8, color="#34D399"))
+
+    if (result.retest_level is not None and result.retest_tolerance is not None
+            and result.bos_bar is not None):
+        rl, rt = result.retest_level, result.retest_tolerance
+        fig.add_shape(type="rect", x0=result.bos_bar, x1=n - 1,
+                      y0=rl - rt, y1=rl + rt,
+                      fillcolor="rgba(251,191,36,0.10)",
+                      line=dict(color="#FBBF24", width=1, dash="dot"))
+        fig.add_annotation(x=(result.bos_bar + n) // 2, y=rl + rt,
+                           text="Retest zone", yanchor="bottom", showarrow=False,
+                           font=dict(size=8, color="#FBBF24"))
+        fig.add_annotation(x=result.bos_bar, y=rl,
+                           text="BOS", xanchor="left", showarrow=False,
+                           font=dict(size=9, color="#10B981"))
+
+    if result.entry_bar is not None and result.entry_price is not None:
+        for px, color, label in [
+            (result.entry_price, "#FBBF24", "ENTRY"),
+            (result.sl_price,    "#F87171", "SL"),
+            (result.tp1_price,   "#34D399", "TP1"),
+            (result.tp2_price,   "#10B981", "TP2"),
+        ]:
+            if px is None:
+                continue
+            fig.add_shape(type="line", x0=result.entry_bar, x1=n - 1,
+                          y0=px, y1=px,
+                          line=dict(color=color, width=1.2,
+                                    dash="solid" if label == "ENTRY" else "dash"))
+            fig.add_annotation(x=result.entry_bar, y=px, text=label,
+                               xanchor="right", showarrow=False,
+                               font=dict(size=8, color=color))
+
+    for tk in result.tickets:
+        if tk.exit_bar >= 0:
+            icon = "✅" if tk.status in ("TP1", "TP2") else "✗"
+            col  = "#34D399" if tk.status in ("TP1", "TP2") else "#F87171"
+            fig.add_annotation(x=tk.exit_bar, y=tk.exit_price,
+                               text=f"{icon}{tk.status}", showarrow=True,
+                               arrowhead=2, arrowcolor=col, ax=0, ay=-18,
+                               font=dict(size=8, color=col))
+
+    fig.update_layout(
+        paper_bgcolor="#0f172a", plot_bgcolor="#111827",
+        font=dict(color="#E5E7EB", size=11),
+        height=420, margin=dict(l=50, r=160, t=20, b=30),
+        xaxis=dict(
+            showgrid=True, gridcolor="#1f2937",
+            tickvals=tick_idxs,
+            ticktext=[ts_labels[i] if i < len(ts_labels) else "" for i in tick_idxs],
+            rangeslider_visible=False,
+        ),
+        yaxis=dict(showgrid=True, gridcolor="#1f2937"),
+        legend=dict(orientation="h", yanchor="bottom", y=1.01, bgcolor="rgba(0,0,0,0)"),
+    )
+    return fig
+
+
+def _reversal_signal_card(result: ReversalResult) -> None:
+    s = result.current_state
+    STATE_CARD = {
+        0: ("rev-card-watch",   "◉  WATCHING — scanning key levels"),
+        1: ("rev-card-sweep",   "⚡  SWEEP DETECTED — awaiting close-back rejection"),
+        2: ("rev-card-reject",  "↓  REJECTED — awaiting displacement + BOS"),
+        3: ("rev-card-bos",     "✂  BOS CONFIRMED — awaiting retest"),
+        4: ("rev-card-basket",  f"◆  IN BASKET — {result.direction}"),
+        5: ("rev-card-partial", "✅  PARTIAL EXIT — TP1 hit, second half running to TP2"),
+        6: ("rev-card-closed",  "⏹  BASKET CLOSED"),
+    }
+    card_cls, status = STATE_CARD.get(s, ("rev-card-watch", f"State {s}"))
+
+    sub = ""
+    if result.skip_reason:
+        sub = f"Last skip: {result.skip_reason}"
+    elif s >= 4 and result.entry_price is not None:
+        dir_color = "#F87171" if result.direction == "SHORT" else "#34D399"
+        sub = (
+            f'<span style="color:{dir_color};font-weight:700">{result.direction}</span>'
+            f' @ {result.entry_price:.2f}  ·  SL {result.sl_price:.2f}'
+            f'  ·  TP1 {result.tp1_price:.2f}  ·  TP2 {result.tp2_price:.2f}'
+        )
+    elif s == 1 and result.swept_level_price is not None:
+        lbl = LEVEL_LABEL.get(result.swept_level_key or "", result.swept_level_key or "")
+        sub = f"Swept {lbl} @ {result.swept_level_price:.2f}  ·  extreme: {result.sweep_extreme:.2f}"
+    elif s in (2, 3) and result.swing_ref_price is not None:
+        retest_str = f"  ·  retest zone: {result.retest_level:.2f}" if result.retest_level else ""
+        sub = f"Swing ref: {result.swing_ref_price:.2f}{retest_str}"
+
+    pnl_html = ""
+    if result.tickets:
+        total = result.realized_pnl_usd + result.open_pnl_usd
+        pnl_color = "#34D399" if total >= 0 else "#F87171"
+        pnl_html = (
+            f'<div style="margin-top:10px">'
+            f'<span style="color:{pnl_color};font-size:1.4em;font-weight:800">${total:+.2f}</span>'
+            f'<span style="color:#6B7280;font-size:.8em;margin-left:8px">'
+            f'realized ${result.realized_pnl_usd:+.2f} / open ${result.open_pnl_usd:+.2f}</span>'
+            f'</div>'
+            f'<div style="color:#9CA3AF;font-size:.82em;margin-top:6px">'
+            f'{result.n_tickets} tickets · {result.total_lots:.2f} lots total'
+            f' · basket risk ${result.basket_risk_usd:.2f}'
+            f' · RR to TP2: {result.rr_available:.1f}R'
+            f'</div>'
+        )
+
+    st.markdown(
+        f'<div class="rev-card {card_cls}">'
+        f'<div style="font-size:1.4em;font-weight:800;letter-spacing:.04em">{status}</div>'
+        f'<div style="font-size:.9em;color:rgba(255,255,255,.65);margin-top:4px">{sub}</div>'
+        f'{pnl_html}'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+
+def _basket_table(result: ReversalResult, latest_price: float) -> None:
+    if not result.tickets:
+        st.caption("No basket yet.")
+        return
+
+    rows = []
+    for idx, tk in enumerate(result.tickets):
+        if tk.status == "OPEN":
+            if result.direction == "SHORT":
+                live_pnl = (tk.entry - latest_price) * tk.lots * 100
+            else:
+                live_pnl = (latest_price - tk.entry) * tk.lots * 100
+            pnl_str = f"${live_pnl:+.2f} live"
+            pnl_col = "#34D399" if live_pnl >= 0 else "#F87171"
+            sc = "#FCD34D"
+        else:
+            pnl_str = f"${tk.pnl_usd:+.2f}"
+            pnl_col = "#34D399" if tk.pnl_usd >= 0 else "#F87171"
+            sc = "#34D399" if tk.status in ("TP1", "TP2") else "#F87171"
+
+        target_color = "#34D399" if tk.tp_target == "TP1" else "#10B981"
+        tp_price = tk.tp1 if tk.tp_target == "TP1" else tk.tp2
+        rows.append(
+            f'<tr>'
+            f'<td style="color:#9CA3AF">#{idx + 1}</td>'
+            f'<td style="color:{target_color};font-weight:700">{tk.tp_target}</td>'
+            f'<td>{tk.lots:.2f}</td>'
+            f'<td style="color:#FCD34D">{tk.entry:.2f}</td>'
+            f'<td style="color:#F87171">{tk.sl:.2f}</td>'
+            f'<td style="color:{target_color}">{tp_price:.2f}</td>'
+            f'<td style="color:{sc};font-weight:600">{tk.status}</td>'
+            f'<td style="color:{pnl_col};font-weight:700;text-align:right">{pnl_str}</td>'
+            f'</tr>'
+        )
+
+    html = (
+        '<table class="basket-tbl"><thead><tr>'
+        '<th>#</th><th>Target</th><th>Lots</th>'
+        '<th>Entry</th><th>SL</th><th>TP price</th><th>Status</th>'
+        '<th style="text-align:right">P&amp;L</th>'
+        '</tr></thead><tbody>' + "".join(rows) + '</tbody></table>'
+    )
+    st.markdown(html, unsafe_allow_html=True)
+
+
+def _reversal_narrative_feed(result: ReversalResult, df_5m: pd.DataFrame) -> None:
+    if not result.narrative:
+        st.info("No narrative yet — waiting for data.")
+        return
+
+    _ICONS = {
+        "info":    "◉",
+        "pass":    "✅",
+        "fail":    "✗",
+        "wait":    "⏳",
+        "scan":    "↺",
+        "entry":   "◆",
+        "exit_tp": "🏁",
+        "exit_sl": "✗",
+    }
+    _HEAD_COLORS = {
+        "info":    "#60A5FA",
+        "pass":    "#34D399",
+        "fail":    "#F87171",
+        "wait":    "#FCD34D",
+        "scan":    "#6B7280",
+        "entry":   "#FBBF24",
+        "exit_tp": "#34D399",
+        "exit_sl": "#F87171",
+    }
+
+    html_parts = []
+    for ev in result.narrative:
+        ts      = _rev_bar_ts(df_5m, ev.bar_idx)
+        icon    = _ICONS.get(ev.status, "·")
+        col     = _HEAD_COLORS.get(ev.status, "#E5E7EB")
+        css     = f"nar-{ev.status.replace('_', '-')}"
+        details = "".join(f'<div class="nar-detail">{d}</div>' for d in ev.details)
+        html_parts.append(f"""
+<div class="nar-msg {css}">
+  <span class="nar-time">{ts} NY</span>
+  <span class="nar-icon">{icon}</span>
+  <span class="nar-head" style="color:{col}">{ev.headline}</span>
+  {details}
+</div>""")
+
+    st.markdown("\n".join(html_parts), unsafe_allow_html=True)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _load_gold_bars_cached(_tick: int) -> pd.DataFrame:
+    try:
+        return fetch_gold_bars(interval="5m", days=3)
+    except Exception:
+        return pd.DataFrame()
+
+
+def render_reversal_tab() -> None:
+    st.markdown("#### Gold HOD/LOD Reversal — Paper Trading")
+    st.caption(
+        "Kirk's 8-ticket basket setup · 5m bars (GC=F) · "
+        "$10K account · 1% risk ($100 total basket) · TP1 @ 2R / TP2 @ liquidity"
+    )
+
+    df_5m = _load_gold_bars_cached(get_tick())
+
+    if df_5m.empty:
+        st.error("Gold data unavailable — yfinance may be rate-limited. Try refreshing in 60s.")
+        return
+
+    try:
+        key_levels = compute_key_levels(df_5m)
+    except Exception as e:
+        st.error(f"Key level computation failed: {e}")
+        key_levels = {}
+
+    n = len(df_5m)
+    reveal_idx = st.slider(
+        "Replay to bar", min_value=20, max_value=n - 1, value=n - 1,
+        key="rev_reveal",
+        help="Drag left to replay the setup development bar by bar",
+    )
+
+    result = run_reversal_engine(
+        df_5m, key_levels, reveal_idx,
+        account_equity=ACCOUNT_SIZE,
+        risk_pct=RISK_PCT,
+        max_positions=8,
+    )
+
+    latest_price = float(df_5m["close"].iloc[reveal_idx])
+
+    if key_levels:
+        pills = "".join(
+            f'<span class="rev-lv" style="color:{LEVEL_COLORS.get(k, "#6B7280")}">'
+            f'{LEVEL_LABEL.get(k, k)}: {v:.2f}</span>'
+            for k, v in key_levels.items()
+        )
+        st.markdown(f'<div class="rev-level-grid">{pills}</div>', unsafe_allow_html=True)
+    else:
+        st.warning("No key levels — check data has at least one prior session.")
+
+    col_left, col_right = st.columns([3, 2])
+
+    with col_left:
+        _reversal_signal_card(result)
+        st.plotly_chart(
+            build_reversal_chart(df_5m, result, key_levels, reveal_idx),
+            use_container_width=True,
+            key="rev_chart",
+        )
+        if result.n_tickets > 0:
+            st.markdown("**Basket tickets**")
+            _basket_table(result, latest_price)
+
+    with col_right:
+        state_label = REV_STATES.get(result.current_state, f"State {result.current_state}")
+        st.markdown(f"**Engine Reasoning** — {state_label}")
+        st.caption("Decision log · scroll down for most recent")
+        with st.container(height=720):
+            _reversal_narrative_feed(result, df_5m)
+
+
 # ── Page ──────────────────────────────────────────────────────────────────────
 st.markdown("## Kirk Strategy — Live Signals")
 st.caption(
@@ -951,8 +1330,10 @@ auto_refresh_bar()
 
 tick = get_tick()
 today_str_main = datetime.now(NY).strftime("%Y-%m-%d")
-tabs = st.tabs(INSTRUMENTS)
-for tab, instrument in zip(tabs, INSTRUMENTS):
+tabs = st.tabs(["⬡ Gold HOD/LOD"] + list(INSTRUMENTS))
+with tabs[0]:
+    render_reversal_tab()
+for tab, instrument in zip(tabs[1:], INSTRUMENTS):
     with tab:
         with st.spinner(f"Loading {instrument}…"):
             df_live, asian_end_bar_live = load_data(instrument, tick)
